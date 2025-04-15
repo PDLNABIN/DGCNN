@@ -1,15 +1,11 @@
-# Core requirements
+
 streamlit>=1.26.0
 torch>=2.0.0
 numpy>=1.24.0
 scipy>=1.10.0
 plotly>=5.18.0
 laspy>=2.0.0
-
-# For advanced visualization (optional but recommended)
 leafmap>=0.27.0
 open3d>=0.17.0
-
-# Additional dependencies
 tempfile>=0.1.0
 base64>=1.0.0
