@@ -1,41 +1,38 @@
-# app.py
 import streamlit as st
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import laspy
 import os
 import plotly.graph_objects as go
-from tqdm import tqdm # For progress indication during inference
-import tempfile # To handle uploaded file
-from scipy.spatial import KDTree # <-- Import KDTree
+import tempfile
+from scipy.spatial import KDTree
+import base64
 
-# --- Import the model class and helpers (Requires model_definition.py in the same directory) ---
+# Try to import leafmap for visualization options
+try:
+    import leafmap
+    import open3d as o3d
+    LEAFMAP_AVAILABLE = True
+except ImportError:
+    LEAFMAP_AVAILABLE = False
+
+# Import model definition
 try:
     from model_definition import DGCNN, knn, get_graph_feature
 except ImportError:
-    st.error("Error: Could not import from 'model_definition.py'. Make sure the file exists in the same directory as app.py and contains the DGCNN class and helper functions.")
-    st.stop() # Stop execution if model definition is missing
+    st.error("Error: Could not import model_definition.py")
+    st.stop()
 
-
-# --- Configuration ---
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# --- FIXED MODEL PATH ---
 MODEL_PATH = "best_model.pth"
-
-# --- FIXED MODEL PARAMETER ---
 K_NEIGHBORS_FIXED = 20
 
-# --- Model Loading Function ---
 @st.cache_resource
 def load_model(model_path, k_neighbors=K_NEIGHBORS_FIXED):
-    # ... (load_model function remains the same) ...
     if not os.path.exists(model_path):
         st.error(f"Error: Model checkpoint file not found at '{model_path}'.")
-        st.error("Please ensure the model file exists at the specified location.")
         return None
 
     try:
@@ -43,210 +40,427 @@ def load_model(model_path, k_neighbors=K_NEIGHBORS_FIXED):
         checkpoint = torch.load(model_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
-        st.success(f"Model loaded successfully from '{model_path}' (k={k_neighbors})")
         return model
     except Exception as e:
         st.error(f"Error loading model checkpoint: {e}")
-        st.exception(e)
         return None
 
-
-# --- Inference Function (OPTIMIZED with KDTree) ---
-def run_inference_for_visualization(model, las_data, device, num_points_per_region=1024, sample_fraction=0.1):
-    """
-    Perform inference on LAS data (Optimized with KDTree) and return points with predictions.
-    """
+def run_inference(model, las_data, device, num_points_per_region=1024, sample_fraction=0.1):
+    """Perform inference on LAS data using KDTree optimization"""
     x, y, z = las_data.x, las_data.y, las_data.z
     num_all_points = len(x)
 
     if num_all_points == 0:
         st.warning("No points found in the LAS file.")
-        return None, None
+        return None, None, None, None, None
 
-    # Extract XYZ coordinates for KDTree and features
+    # Extract XYZ coordinates for KDTree
     points_xyz = np.column_stack((x, y, z))
-
-    # --- Feature Extraction ---
-    default_rgb_val = 0.5
-    if hasattr(las_data, 'red') and hasattr(las_data, 'green') and hasattr(las_data, 'blue') and len(las_data.red) == num_all_points:
-        r, g, b = las_data.red, las_data.green, las_data.blue
-        max_r, max_g, max_b = (np.max(c) if len(c)>0 else 1 for c in (r,g,b))
-        max_val = max(max_r, max_g, max_b, 1)
-        norm_factor = 65535.0 if max_val > 255 else 255.0
-        r = (r / norm_factor).astype(np.float32)
-        g = (g / norm_factor).astype(np.float32)
-        b = (b / norm_factor).astype(np.float32)
+    
+    # Handle RGB data
+    default_rgb_val = 128
+    has_rgb = False
+    
+    if hasattr(las_data, 'red') and hasattr(las_data, 'green') and hasattr(las_data, 'blue') and \
+       len(las_data.red) == num_all_points:
+        
+        r_orig, g_orig, b_orig = las_data.red, las_data.green, las_data.blue
+        max_val = max(np.max(r_orig), np.max(g_orig), np.max(b_orig), 1)
+        
+        if max_val > 255:
+            # Scale 16-bit to 8-bit for display
+            r_display = (r_orig / 65535.0 * 255.0).astype(np.uint8)
+            g_display = (g_orig / 65535.0 * 255.0).astype(np.uint8)
+            b_display = (b_orig / 65535.0 * 255.0).astype(np.uint8)
+            # Normalize for model features (0-1)
+            r_feat = (r_orig / 65535.0).astype(np.float32)
+            g_feat = (g_orig / 65535.0).astype(np.float32)
+            b_feat = (b_orig / 65535.0).astype(np.float32)
+        else:
+            r_display = r_orig.astype(np.uint8)
+            g_display = g_orig.astype(np.uint8)
+            b_display = b_orig.astype(np.uint8)
+            r_feat = (r_orig / 255.0).astype(np.float32)
+            g_feat = (g_orig / 255.0).astype(np.float32)
+            b_feat = (b_orig / 255.0).astype(np.float32)
+        has_rgb = True
     else:
-        st.warning("RGB data not found or incomplete in LAS file. Using default gray color.")
-        r = np.full(num_all_points, default_rgb_val, dtype=np.float32)
-        g = np.full(num_all_points, default_rgb_val, dtype=np.float32)
-        b = np.full(num_all_points, default_rgb_val, dtype=np.float32)
+        # Use default gray
+        r_display = g_display = b_display = np.full(num_all_points, default_rgb_val, dtype=np.uint8)
+        r_feat = g_feat = b_feat = np.full(num_all_points, 0.5, dtype=np.float32)
 
-    all_points_features = np.column_stack((x, y, z, r, g, b))
+    # Features for the model
+    all_points_features = np.column_stack((x, y, z, r_feat, g_feat, b_feat))
     predictions = np.zeros(num_all_points, dtype=int)
 
-    # --- Build KDTree (build once before loop) ---
-    st.info("Building KDTree for efficient neighbor search...")
+    # Build KDTree
+    st.info("Building KDTree...")
     try:
         kdtree = KDTree(points_xyz)
     except Exception as e:
-        st.error(f"Error building KDTree: {e}. Check if points_xyz is valid.")
-        return None, None # Stop if KDTree fails
-    st.info("KDTree built.")
+        st.error(f"Error building KDTree: {e}")
+        return None, None, None, None, None
 
-
-    # --- Sampling for Inference ---
-    sample_size = int(num_all_points * sample_fraction)
-    sample_size = max(min(sample_size, num_all_points), 0)
-
-    if sample_size == 0:
-         st.warning("Not enough points to sample for inference based on fraction.")
-         return points_xyz, predictions
-
+    # Sample points for inference
+    sample_size = max(min(int(num_all_points * sample_fraction), num_all_points), 1)
     sampled_indices = np.random.choice(num_all_points, sample_size, replace=False)
+    
     st.info(f"Running inference on {sample_size} sampled regions...")
-
-    # --- Run Inference on Sampled Regions (using KDTree query) ---
     progress_bar = st.progress(0)
-    model.eval()
+    
+    # Run inference
     with torch.no_grad():
         for i, idx in enumerate(sampled_indices):
             center_point_xyz = points_xyz[idx]
-
-            # --- Query KDTree for nearest neighbors ---
-            # Query for k neighbors (k=num_points_per_region). Returns distances, indices.
-            # Add 1 to k because query point itself is included if it exists in the tree data
+            
+            # Query KDTree for nearest neighbors
             k_query = min(num_points_per_region + 1, num_all_points)
             try:
                 distances, nearest_indices = kdtree.query(center_point_xyz, k=k_query)
             except Exception as e:
-                 st.warning(f"KDTree query failed for point {idx}: {e}. Skipping region.")
-                 continue # Skip this region if query fails
-
-            # If k_query returned a single point (distances is float), make it array
+                continue
+                
             if isinstance(nearest_indices, (int, np.integer)):
                 nearest_indices = [nearest_indices]
-
-            # Remove the query point itself if it's in the results (often the first one)
-            # Keep only the required number of neighbors
+                
             valid_neighbor_indices = [ni for ni in nearest_indices if ni != idx][:num_points_per_region]
-
+            
             if not valid_neighbor_indices:
-                 continue # Skip if no valid neighbors found
-
-            # Get features for the region using the found indices
-            region_features = all_points_features[valid_neighbor_indices]
-
-            # Center the region coordinates (XYZ) relative to the center point
-            centered_region_features = region_features.copy()
-            centered_region_features[:, :3] = region_features[:, :3] - center_point_xyz #:3] unnecessary here
-
-            # Ensure region has exactly num_points_per_region by padding if necessary
-            current_region_size = centered_region_features.shape[0]
+                continue
+                
+            # Get features for the model
+            region_features_model = all_points_features[valid_neighbor_indices]
+            
+            # Center coordinates
+            centered_region_features_model = region_features_model.copy()
+            centered_region_features_model[:, :3] = region_features_model[:, :3] - center_point_xyz
+            
+            # Ensure region has exactly num_points_per_region
+            current_region_size = centered_region_features_model.shape[0]
             if current_region_size < num_points_per_region:
                 num_to_pad = num_points_per_region - current_region_size
-                padding = np.repeat(centered_region_features[-1:], num_to_pad, axis=0)
-                centered_region_features = np.vstack((centered_region_features, padding))
-
-            # Prepare input for model: [1, F, N]
-            inputs = torch.FloatTensor(centered_region_features).unsqueeze(0).permute(0, 2, 1).to(device)
-
+                padding = np.repeat(centered_region_features_model[-1:], num_to_pad, axis=0)
+                centered_region_features_model = np.vstack((centered_region_features_model, padding))
+                
+            # Prepare input for model
+            inputs = torch.FloatTensor(centered_region_features_model).unsqueeze(0).permute(0, 2, 1).to(device)
+            
             # Forward pass
             outputs = model(inputs)
             _, predicted_label = outputs.max(1)
-
-            # If predicted as pothole (label 1), mark points in that original region as pothole
+            
+            # Mark points as pothole if predicted
             if predicted_label.item() == 1:
-                predictions[valid_neighbor_indices] = 1 # Assign pothole label to neighbors
-
-            # Update progress bar
+                predictions[valid_neighbor_indices] = 1
+                
+            # Update progress
             progress_bar.progress((i + 1) / sample_size)
-
+            
     progress_bar.empty()
     st.success("Inference complete.")
     num_potholes = np.sum(predictions)
     st.info(f"Found {num_potholes} potential pothole points out of {num_all_points} total points.")
-    return points_xyz, predictions # Return original XYZ and predictions
+    
+    return points_xyz, predictions, r_display, g_display, b_display
 
-
-# --- Visualization Function ---
-def plot_point_cloud(points_xyz, predictions):
-    # ... (Visualization function remains the same as before) ...
-    if points_xyz is None or predictions is None or len(points_xyz) == 0:
-        st.warning("Cannot generate plot: No point data available.")
+def visualize_with_leafmap(points_xyz, r, g, b, predictions=None, backend="pyvista", point_size=1.0):
+    """Create visualization with leafmap"""
+    if not LEAFMAP_AVAILABLE:
+        st.error("Leafmap visualization requires leafmap and open3d packages.")
         return None
-    x, y, z = points_xyz[:, 0], points_xyz[:, 1], points_xyz[:, 2]
-    point_colors = np.where(predictions == 1, 'red', 'blue')
-    trace = go.Scatter3d(
-        x=x, y=y, z=z,
-        mode='markers',
-        marker=dict(size=1.5, color=point_colors, opacity=0.8),
-        name='Points'
-    )
-    layout = go.Layout(
-        title='Pothole Detection Visualization (Red = Pothole)',
-        scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z', aspectmode='data', bgcolor='rgba(0,0,0,0)'),
-        legend=dict(itemsizing='constant'),
-        margin=dict(l=10, r=10, b=10, t=40),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)'
-    )
-    fig = go.Figure(data=[trace], layout=layout)
-    return fig
+        
+    # Create a temporary LAS file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".las") as tmp_file:
+        tmp_path = tmp_file.name
+    
+    try:
+        # Create a new LAS file
+        header = laspy.LasHeader(point_format=7)
+        las = laspy.LasData(header)
+        
+        # Set coordinates
+        las.x = points_xyz[:, 0]
+        las.y = points_xyz[:, 1]
+        las.z = points_xyz[:, 2]
+        
+        # Set colors
+        max_color = max(np.max(r), np.max(g), np.max(b))
+        if max_color <= 255:
+            # Scale from 0-255 to 0-65535 for LAS format
+            las.red = (r * 257).astype(np.uint16)
+            las.green = (g * 257).astype(np.uint16)
+            las.blue = (b * 257).astype(np.uint16)
+        else:
+            las.red = r.astype(np.uint16)
+            las.green = g.astype(np.uint16)
+            las.blue = b.astype(np.uint16)
+        
+        # Set classification if predictions are provided
+        if predictions is not None:
+            classification = np.ones(len(predictions), dtype=np.uint8)
+            classification[predictions == 1] = 7  # Mark potholes as class 7
+            las.classification = classification
+        
+        # Write to file
+        las.write(tmp_path)
+        
+        # Generate visualization with specified backend
+        color_options = {"color_column": "classification"} if predictions is not None else {"cmap": "terrain"}
+        
+        # Generate HTML for visualization
+        html = leafmap.view_lidar(
+            tmp_path,
+            background="white", 
+            backend=backend,
+            return_as="html",
+            point_size=point_size,
+            width=800,
+            height=600,
+            **color_options
+        )
+        return html
+            
+    except Exception as e:
+        st.error(f"Error creating visualization: {e}")
+        return None
+    finally:
+        # Clean up
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
 
+def export_las_with_predictions(las_data, predictions, output_path="pothole_results.las"):
+    """Export LAS file with pothole classifications"""
+    try:
+        new_las = laspy.LasData(las_data.header)
+        
+        # Copy all point data
+        for dimension in las_data.point_format.dimension_names:
+            setattr(new_las, dimension, getattr(las_data, dimension))
+        
+        # Add classification field
+        classification = np.ones(len(predictions), dtype=np.uint8)
+        classification[predictions == 1] = 7  # Mark potholes as class 7
+        
+        new_las.classification = classification
+        new_las.write(output_path)
+        return output_path
+    except Exception as e:
+        st.error(f"Error exporting LAS file: {e}")
+        return None
 
-# --- Streamlit App UI ---
-st.set_page_config(layout="wide", page_title="Pothole Detection from LAS")
-st.title("🛣️ 3D Pothole Detection from LAS Point Cloud")
-st.write("Upload a `.las` file to visualize the point cloud and detected potholes.")
+def get_download_link(file_path, link_text):
+    """Create download link for file"""
+    with open(file_path, "rb") as f:
+        data = f.read()
+    b64 = base64.b64encode(data).decode()
+    filename = os.path.basename(file_path)
+    href = f'<a href="data:application/octet-stream;base64,{b64}" download="{filename}">{link_text}</a>'
+    return href
+
+# Streamlit App UI
+st.set_page_config(layout="wide", page_title="3D Pothole Detection", initial_sidebar_state="expanded")
+
+# Header
+st.title("🛣️ 3D Pothole Detection & Visualization")
+st.markdown("Upload a `.las` or `.laz` file to detect and visualize potholes.")
+
+# Sidebar Configuration
 st.sidebar.header("⚙️ Configuration")
-st.sidebar.info(f"Using device: {device}")
-st.sidebar.info(f"Using fixed k-neighbors: {K_NEIGHBORS_FIXED}")
-st.sidebar.info(f"Attempting to load model from: '{MODEL_PATH}'")
+st.sidebar.info(f"Using device: **{str(device).upper()}**")
 
-# Inference parameters
-num_region_points = st.sidebar.slider("Points per Region (Inference)", 512, 4096, 1024, help="Number of points sampled around a center point for inference.")
-inference_sample_fraction = st.sidebar.slider("Inference Sample Fraction", 0.01, 1.0, 0.1, 0.01, help="Fraction of total points to use as centers for inference (higher values are more accurate but slower).")
+# Parameters
+num_region_points = st.sidebar.slider("Points per Region", 512, 2048, 1024, 128)
+inference_sample_fraction = st.sidebar.slider("Inference Sample Fraction", 0.01, 0.5, 0.1, 0.01)
+vis_method = st.sidebar.selectbox("Visualization Method", 
+                                 ["Leafmap", "Plotly 3D"],
+                                 help="Choose visualization method")
 
-# --- Load Model ---
+# Leafmap specific options
+if vis_method == "Leafmap" and LEAFMAP_AVAILABLE:
+    leafmap_backend = st.sidebar.selectbox(
+        "Leafmap Backend",
+        ["pyvista", "open3d", "ipygany", "panel"],
+        index=0,
+        help="Select the backend for leafmap visualization"
+    )
+    
+    point_size = st.sidebar.slider(
+        "Point Size", 
+        min_value=0.5, 
+        max_value=5.0, 
+        value=1.5, 
+        step=0.1,
+        help="Size of the points in the visualization"
+    )
+    
+    colorby = st.sidebar.radio(
+        "Color By",
+        ["Original", "Classification (Pothole/Non-Pothole)"],
+        index=1,
+        help="Choose how to color the points"
+    )
+
+# Load model
 model = load_model(MODEL_PATH)
 
-# --- Main Area ---
-uploaded_file = st.file_uploader("📂 Upload your .las file", type=["las"])
+# Main UI
+tab_upload, tab_results = st.tabs(["📤 Upload & Process", "📊 Results & Visualization"])
 
-if uploaded_file is not None and model is not None:
-    st.write("---")
-    st.subheader("Processing Uploaded File...")
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".las") as tmp_file:
-        tmp_file.write(uploaded_file.getvalue())
-        tmp_file_path = tmp_file.name
-    try:
-        las_data = laspy.read(tmp_file_path)
-        st.success(f"Successfully read '{uploaded_file.name}'. Contains {len(las_data.points)} points.")
-        points_xyz, predictions = run_inference_for_visualization(
-            model, las_data, device,
-            num_points_per_region=num_region_points,
-            sample_fraction=inference_sample_fraction
-        )
-        if points_xyz is not None:
-            st.subheader("📊 Visualization")
-            with st.spinner("Generating 3D plot..."):
-                 fig = plot_point_cloud(points_xyz, predictions)
-                 if fig:
-                     st.plotly_chart(fig, use_container_width=True)
+with tab_upload:
+    st.subheader("📂 Upload LAS/LAZ File")
+    uploaded_file = st.file_uploader("Select file:", type=["las", "laz"], label_visibility="collapsed")
+    
+    if uploaded_file is not None and model is not None:
+        st.write("---")
+        st.info(f"Processing '{uploaded_file.name}'...")
+        
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".las") as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_file_path = tmp_file.name
+
+        try:
+            las_data = laspy.read(tmp_file_path)
+            st.success(f"Successfully read file. Contains **{len(las_data.points):,}** points.")
+
+            # Run inference
+            with st.spinner("Running pothole detection... This may take a while."):
+                 points_xyz, predictions, r_display, g_display, b_display = run_inference(
+                    model, las_data, device,
+                    num_points_per_region=num_region_points,
+                    sample_fraction=inference_sample_fraction
+                 )
+                 
+                 if points_xyz is not None:
+                    # Store results for visualization
+                    st.session_state['points_xyz'] = points_xyz
+                    st.session_state['predictions'] = predictions
+                    st.session_state['r_display'] = r_display
+                    st.session_state['g_display'] = g_display
+                    st.session_state['b_display'] = b_display
+                    st.session_state['las_data'] = las_data
+                    st.session_state['filename'] = uploaded_file.name
+                    
+                    # Success message
+                    num_potholes = np.sum(predictions == 1)
+                    pothole_percentage = (num_potholes / len(predictions)) * 100
+                    
+                    st.success("✅ Processing complete! Switch to 'Results & Visualization' tab.")
+                    
+                    # Display metrics
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Total Points", f"{len(predictions):,}")
+                    with col2:
+                        st.metric("Pothole Points", f"{num_potholes:,}")
+                    with col3:
+                        st.metric("Pothole Percentage", f"{pothole_percentage:.2f}%")
                  else:
-                     st.warning("Could not generate plot.")
-        else:
-             st.warning("Inference did not return valid points for visualization.")
-    except Exception as e:
-        st.error(f"An error occurred while processing the file: {e}")
-        st.exception(e)
-    finally:
-        if 'tmp_file_path' in locals() and os.path.exists(tmp_file_path):
-            os.remove(tmp_file_path)
-elif uploaded_file is not None and model is None:
-    st.error("Model could not be loaded. Please check the path and file integrity.")
-else:
-    st.info("Upload a .las file to begin.")
-st.write("---")
-st.sidebar.info("App uses a DGCNN model for pothole detection.")
+                    st.error("⚠️ Inference failed. No valid data for visualization.")
+
+        except Exception as e:
+            st.error(f"An error occurred while processing the file:")
+            st.exception(e)
+        finally:
+            if 'tmp_file_path' in locals() and os.path.exists(tmp_file_path):
+                os.remove(tmp_file_path)
+
+    elif uploaded_file is not None and model is None:
+        st.error("Model could not be loaded. Check console errors.")
+    else:
+        st.info("👆 Upload a `.las` or `.laz` file to begin.")
+        
+        # Example images
+        st.subheader("Example Visualizations")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.image("https://i.imgur.com/XQGWbJk.gif", caption="Panel Backend")
+        with col2:
+            st.image("https://i.imgur.com/rL85fbl.gif", caption="Open3D Backend")
+
+with tab_results:
+    st.subheader("📊 Visualization Results")
+    
+    if 'points_xyz' in st.session_state:
+        # Export option
+        export_col1, export_col2 = st.columns([3, 1])
+        with export_col1:
+            st.subheader("🔍 Export Results")
+        
+        with export_col2:
+            export_button = st.button("Export as LAS", type="primary")
+        
+        if export_button:
+            with st.spinner("Exporting results to LAS file..."):
+                output_path = f"pothole_results_{os.path.basename(st.session_state['filename'])}"
+                result_path = export_las_with_predictions(
+                    st.session_state['las_data'], 
+                    st.session_state['predictions'], 
+                    output_path
+                )
+                if result_path:
+                    st.success(f"Results exported successfully")
+                    st.markdown(get_download_link(result_path, "📥 Download Results"), unsafe_allow_html=True)
+        
+        # Visualization
+        st.subheader("📊 Point Cloud Visualization")
+        
+        if vis_method == "Leafmap" and LEAFMAP_AVAILABLE:
+            st.markdown(f"Using Leafmap with **{leafmap_backend}** backend")
+            
+            use_predictions = colorby == "Classification (Pothole/Non-Pothole)"
+            
+            with st.spinner(f"Generating visualization..."):
+                html_content = visualize_with_leafmap(
+                    st.session_state['points_xyz'], 
+                    st.session_state['r_display'], 
+                    st.session_state['g_display'], 
+                    st.session_state['b_display'], 
+                    predictions=st.session_state['predictions'] if use_predictions else None,
+                    backend=leafmap_backend,
+                    point_size=point_size
+                )
+                
+                if html_content:
+                    st.components.v1.html(html_content, height=700)
+                else:
+                    st.warning("Could not generate visualization.")
+        
+        # Display pothole stats
+        st.subheader("📈 Pothole Detection Stats")
+        num_potholes = np.sum(st.session_state['predictions'] == 1)
+        total_points = len(st.session_state['predictions'])
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Points", f"{total_points:,}")
+        with col2:
+            st.metric("Pothole Points", f"{num_potholes:,}")
+        with col3:
+            st.metric("Pothole Percentage", f"{(num_potholes/total_points*100):.2f}%")
+            
+    else:
+        st.info("No data available for visualization. Please upload and process a file first.")
+
+# Help section in sidebar
+with st.sidebar.expander("❓ Need Help?"):
+    st.markdown("""
+    This app uses a Deep Graph CNN to detect potholes in LiDAR point clouds.
+    
+    **Quick Guide:**
+    1. Upload a LAS/LAZ file
+    2. Adjust parameters if needed
+    3. View results and visualizations
+    4. Export classified results
+    
+    For better visualization, install leafmap:
+    ```
+    pip install "leafmap[lidar]" open3d
+    ```
+    """)
+
+st.sidebar.markdown("---")
+st.sidebar.info("🚗 Drive Safer with Better Road Analysis 🚗")
